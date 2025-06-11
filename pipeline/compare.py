@@ -1,10 +1,9 @@
+import os
+import json
 import chromadb
 from openai import OpenAI
 from .embed import embed_text
-import os
 
-from openai import OpenAI
-import os
 
 def compare_documents_to_markdown(job_id: str):
     client = chromadb.PersistentClient(path="./chroma_db")
@@ -12,12 +11,8 @@ def compare_documents_to_markdown(job_id: str):
 
     llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # Only get entries for this job
-    a_entries = collection.get(
-        where={"$and": [{"index_type": "document_a"}, {"file_id": job_id}]}
-    )
-
-    print("Total entries found", len(a_entries["ids"]))
+    # Retrieve all document A chunks for the job
+    a_entries = collection.get(where={"$and": [{"index_type": "document_a"}, {"file_id": job_id}]})
 
     output_path = f"comparison_{job_id}.md"
     with open(output_path, "w", encoding="utf-8") as f:
@@ -28,7 +23,6 @@ def compare_documents_to_markdown(job_id: str):
 
         embedding = embed_text(doc_a)
 
-        # Query Document B for this job
         result = collection.query(
             query_embeddings=embedding,
             where={"$and": [{"index_type": "document_b"}, {"file_id": job_id}]},
@@ -42,39 +36,60 @@ def compare_documents_to_markdown(job_id: str):
         doc_b = result["documents"][0][0]
         meta_b = result["metadatas"][0][0]
 
-        # GPT diff
-        prompt = f"""You are an analyst comparing two versions of content.
+        # LLM prompt to compare and extract subject + difference
+        prompt = f"""You are a document comparison analyst.
 
-Compare the following two sections and summarize the differences in plain English. Highlight key changes.
+Your job is to compare two chunks of text from different documents and determine if there are any **substantive, meaningful differences**. You should ignore formatting differences, repetition of content, or minor wording changes that do not affect the actual meaning.
 
-If they are functionally the same, say: "No significant difference."
+If there is a meaningful difference, respond with a JSON object like:
+{{
+  "subject": "Short topic or subject line of the chunk",
+  "difference": "Summarize the substantive change clearly and concisely"
+}}
 
-**Document A (page {meta_a.get('pages')}):**
+If there is **no meaningful difference**, respond with this exact JSON:
+{{
+  "subject": "NA",
+  "difference": "No significant difference."
+}}
+
+**Rules:**
+- Respond with valid JSON only — no markdown, no explanation, no commentary.
+- Do NOT highlight differences in phrasing, wording, or layout unless it affects meaning.
+- Do NOT call out duplicate or repeated content if the information is unchanged.
+- If the content is semantically identical, you MUST return the "No significant difference" response.
+- Inlude the page numbers from Document B in the differences
+
+Now compare the chunks below.
+
+Document A (pages {meta_a.get('pages')}):
 {doc_a}
 
-**Document B (page {meta_b.get('pages')}):**
+Document B (pages {meta_b.get('pages')}):
 {doc_b}"""
 
+
         response = llm.chat.completions.create(
-            model="gpt-4-1106-preview",
+            model="gpt-4.1",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
             temperature=0.2
         )
 
-        diff = response.choices[0].message.content.strip()
+        try:
+            parsed = json.loads(response.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"[Warning] Failed to parse response for {id_a}: {e}")
+            continue
 
-        if "no significant difference" in diff.lower():
+        subject = parsed.get("subject", "Untitled Topic")
+        difference = parsed.get("difference", "No significant difference.")
+
+        if "no significant difference" in difference.lower():
             print(f"Omitting {id_a} - no significant difference.")
             continue
 
         with open(output_path, "a", encoding="utf-8") as f:
-            f.write(f"""## Difference for Page {meta_a.get('pages')}
-
-{diff}
-
----
-""")
+            f.write(f"## {subject} (Pages {meta_a.get('pages')})\n\n{difference}\n\n---\n")
 
     print(f"Markdown diff report saved to: {output_path}")
-
