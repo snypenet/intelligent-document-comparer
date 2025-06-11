@@ -70,9 +70,8 @@ Document B (pages {meta_b.get('pages')}):
 
 
         response = llm.chat.completions.create(
-            model="gpt-4.1",
+            model=os.getenv("MODEL_TYPE"),
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
             temperature=0.2
         )
 
