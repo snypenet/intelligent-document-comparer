@@ -3,3 +3,4 @@ PyPDF2
 chromadb
 python-dotenv
 tqdm
+markdown

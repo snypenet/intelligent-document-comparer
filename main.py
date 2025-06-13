@@ -4,8 +4,6 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from multiprocessing import Process
-from functools import partial
 from pipeline.chunk_and_store_document import chunk_and_store_document
 from pipeline.compare import compare_documents_to_markdown
 
@@ -30,6 +28,7 @@ def main():
         chunk_and_store_document(args.doc_b, job_id, "document_b", True)
 
     compare_documents_to_markdown(job_id)
+    print(f"[Info] Comparison saved to: comparison_{job_id}.md")
 
 if __name__ == "__main__":
     main()

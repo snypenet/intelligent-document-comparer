@@ -36,7 +36,7 @@ if (Test-Path $activateScript) {
     # Install requirements
     if (Test-Path $requirementsPath) {
         Write-Host "Installing dependencies from $requirementsPath..."
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install -r $requirementsPath
         Write-Host "Dependencies installed."
     } else {

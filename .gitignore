@@ -2,4 +2,4 @@
 __pycache__
 .env
 chroma_db
-comparsion_*.md
+*_*.md
