@@ -35,9 +35,12 @@ Here is the page content:
 def extract_topics_with_llm(page_text: str, current_topics: list[str]) -> list[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-You are a document analyst. Given the following page from a regulatory or policy document, extract a concise list of the main ideas, topics, or rules discussed on this page. Ignore boilerplate, headers, and footers.
+You are a document analyst. Given the following page from a document, extract a concise list of the main ideas, topics, or rules discussed on this page. Ignore boilerplate, headers, and footers. Only keep semantically distinct topics. 
 
-Return only new topics not already in the provided list, separated by the token "||||".
+Return only new topics not semantically similar to any topics in the provided list, separated by the token "||||". 
+
+Example:
+Topic 1||||Topic 2||||Topic 3||||Topic 4
 
 Current list of topics:
 {chr(10).join(current_topics) if current_topics else '(none)'}
@@ -58,7 +61,10 @@ Page content:
 def merge_topics_with_llm(topics_a: list[str], topics_b: list[str]) -> list[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-You are a document analyst. Given two lists of topics extracted from two related documents, produce a single, distinct, concise list of all unique topics that exist across both documents. Remove duplicates, merge similar topics, and ensure the list is comprehensive but not redundant. Return the topics separated by the token "||||".
+You are a document analyst. Given two lists of topics extracted from two related documents, produce a single, distinct, concise list of all unique topics that exist across both documents. Remove duplicates, merge similar topics, and ensure the list is comprehensive but not redundant. Only keep semanticallty different topics.Return the topics separated by the token "||||".
+
+Example:
+Topic 1||||Topic 2||||Topic 3||||Topic 4
 
 List A:
 {chr(10).join(topics_a)}
