@@ -90,11 +90,19 @@ Page content:
 def further_refine_topics_with_llm(topics: list[str]) -> set[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-You are a document analyst refining a list of topics. Take the "List of Topics" and refine them by merging any semantically similar topics into a single broader topic that still captures the core ideas. The final list of topics will be used to power a document search and comparison between two similar documents.
+You are a senior document analyst preparing a refined topic index to support semantic document comparison via Retrieval-Augmented Generation (RAG). Your task is to take the "All Topics" list and consolidate semantically related entries into a concise set of broader topic categories.
 
-Return only the refined list of topics, separated by the delimiter "||||".
+Each final topic must:
 
-List of Topics:
+    Represent a high-level umbrella that generalizes multiple specific themes.
+
+    Be mutually exclusive from the others.
+
+    Be broad enough to group related topics for retrieval, but not so broad that it loses meaning.
+
+    Minimize redundancy and merge any topics that share common regulatory, payment, or care-setting considerations.
+
+Return only the final list of consolidated topic labels, separated by the delimiter ||||.
     {chr(10).join(topics)}
     """
     response = call_with_retries(lambda: client.chat.completions.create(
