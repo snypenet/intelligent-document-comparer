@@ -19,13 +19,14 @@ def main():
     parser.add_argument("--doc_b", required=True, help="Path to PDF B")
     parser.add_argument("--mode", choices=["index_and_compare", "compare_only"], default="index_and_compare",
                         help="Mode to run: either index_and_compare or compare_only")
+    parser.add_argument("--max_pages", type=int, help="Maximum number of pages to process from each document")
     args = parser.parse_args()
 
     job_id = hash_filenames(args.doc_a, args.doc_b)
 
     if args.mode == "index_and_compare":
-        chunk_and_store_document(args.doc_a, job_id, "document_a", False)
-        chunk_and_store_document(args.doc_b, job_id, "document_b", True)
+        chunk_and_store_document(args.doc_a, job_id, "document_a", False, max_pages=args.max_pages)
+        chunk_and_store_document(args.doc_b, job_id, "document_b", True, max_pages=args.max_pages)
 
     compare_documents_to_markdown(job_id)
     print(f"[Info] Comparison saved to: comparison_{job_id}.md")

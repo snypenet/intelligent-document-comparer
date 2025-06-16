@@ -3,3 +3,4 @@ __pycache__
 .env
 chroma_db
 *_*.md
+topics_*_document_*.txt

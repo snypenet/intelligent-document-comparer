@@ -7,6 +7,13 @@ from .db import store_embedding, exists
 from tqdm import tqdm
 import traceback
 from .utils import call_with_retries
+import uuid
+import logging
+from pathlib import Path
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def chunk_with_llm_single_page(page_text: str) -> list[dict]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -35,9 +42,8 @@ Here is the page content:
 def extract_topics_with_llm(page_text: str, current_topics: list[str]) -> list[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-You are a document analyst. Given the following page from a document, extract a concise list of the main ideas, topics, or rules discussed on this page. Ignore boilerplate, headers, and footers. Only keep semantically distinct topics. 
-
-Return only new topics not semantically similar to any topics in the provided list, separated by the token "||||". 
+You are a document analyst extracting main thematic topics from the "Page content". Focus on generating a small set of broad, semantically distinct topics that group related subtopics and policy provisions together. Avoid listing many narrowly defined or overlapping topics. Each topic should cover a comprehensive theme to support efficient retrieval and summarization across a large document. Ignore boilerplate, headers, and footers.
+Return only new topics not semantically similar to any topics in the "Current list of topics", separated by the delimiter "||||". 
 
 Example:
 Topic 1||||Topic 2||||Topic 3||||Topic 4
@@ -57,6 +63,25 @@ Page content:
     # Split and clean topics
     new_topics = [t.strip() for t in content.split("||||") if t.strip()]
     return new_topics
+
+def further_refine_topics_with_llm(topics: list[str]) -> list[str]:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    prompt = f"""
+    You are a document analyst refining a list of topics. Take the "List of Topics" and refine them to remove any semantically similar topics.  The final list of topics will be used to power a document search and comparison between two similar documents.
+
+    Return only the refined list of topics, separated by the delimiter "||||".
+
+    List of Topics:
+    {chr(10).join(topics)}
+    """
+    response = call_with_retries(lambda: client.chat.completions.create(
+        model=os.getenv("MODEL_TYPE"),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    ))
+    content = response.choices[0].message.content.strip()
+    refined_topics = [t.strip() for t in content.split("||||") if t.strip()]
+    return refined_topics
 
 def merge_topics_with_llm(topics_a: list[str], topics_b: list[str]) -> list[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -81,7 +106,18 @@ List B:
     merged_topics = [t.strip() for t in content.split("||||") if t.strip()]
     return merged_topics
 
-def chunk_and_store_document(path: str, file_id: str, index_type: str, use_sliding_window: bool = False, window_size: int = 3):
+def chunk_and_store_document(path: str, file_id: str, index_type: str, use_sliding_window: bool = False, window_size: int = 3, max_pages: int = None):
+    # Create run directory with GUID
+    run_id = str(uuid.uuid4())
+    run_dir = Path(f"runs/{run_id}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created run directory: {run_dir}")
+
+    # Create document-specific directory
+    doc_dir = run_dir / f"{file_id}_{index_type}"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created document directory: {doc_dir}")
+
     topics_path = f"topics_{file_id}_{index_type}.txt"
     other_index_type = "document_b" if index_type == "document_a" else "document_a"
     other_topics_path = f"topics_{file_id}_{other_index_type}.txt"
@@ -90,26 +126,52 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
     # If topics file exists, load topics and skip extraction, but still chunk and embed
     topics_exist = os.path.exists(topics_path)
     if topics_exist:
-        print(f"[Info] Topics file exists for {index_type}, skipping topic extraction: {topics_path}")
+        logger.info(f"Topics file exists for {index_type}, skipping topic extraction: {topics_path}")
         with open(topics_path, "r", encoding="utf-8") as f:
             all_topics = [line.strip() for line in f if line.strip()]
     else:
         all_topics = []
 
     pages = extract_pages(path)
+    if max_pages is not None:
+        pages = pages[:max_pages]
+        logger.info(f"Limiting processing to {max_pages} pages")
+    
     buffer = deque(maxlen=window_size)
     chunk_counter = 0
 
     for i, page in enumerate(tqdm(pages, desc=f"[{index_type.upper()}] Chunking Pages", unit="pg", ascii=True)):
         try:
+            # Create page-specific directory
+            page_dir = doc_dir / f"page_{i+1}"
+            page_dir.mkdir(parents=True,exist_ok=True)
+            logger.info(f"Processing page {i+1} - Output directory: {page_dir}")
+
             # Topic extraction step (only if topics file does not exist)
             if not topics_exist:
                 new_topics = extract_topics_with_llm(page, all_topics)
+                # Save initial topics
+                with open(page_dir / "initial_topics.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(new_topics))
+                logger.info(f"Saved initial topics for page {i+1}")
+
+                # have the LLM check it's own work
+                refined_topics = further_refine_topics_with_llm(new_topics)
+                # Save refined topics
+                with open(page_dir / "refined_topics.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(refined_topics))
+                logger.info(f"Saved refined topics for page {i+1}")
+
                 for topic in new_topics:
                     if topic not in all_topics:
                         all_topics.append(topic)
 
             page_chunks = chunk_with_llm_single_page(page)
+            # Save chunks
+            with open(page_dir / "chunks.txt", "w", encoding="utf-8") as f:
+                f.write("\n\n---CHUNK---\n\n".join(page_chunks))
+            logger.info(f"Saved {len(page_chunks)} chunks for page {i+1}")
+
             for chunk in page_chunks:
                 buffer.append({
                     "chunk_text": chunk,
@@ -153,8 +215,8 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
                         })
                     chunk_counter += 1
         except Exception as e:
+            logger.error(f"Failed to process page {i+1}: {str(e)}")
             traceback.print_exc()
-            print(f"[Warning] Failed to chunk page {i}: {e}")
 
     # After all pages, process any remaining windows in buffer (for sliding window mode)
     if use_sliding_window and len(buffer) > 1:
@@ -184,6 +246,7 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
         with open(topics_path, "w", encoding="utf-8") as f:
             for topic in all_topics:
                 f.write(topic + "\n")
+        logger.info(f"Saved final topics to {topics_path}")
 
     # If both topic files exist and merged file does not, merge and deduplicate them using the LLM
     if os.path.exists(topics_path) and os.path.exists(other_topics_path) and not os.path.exists(merged_topics_path):
@@ -195,3 +258,4 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
         with open(merged_topics_path, "w", encoding="utf-8") as f:
             for topic in merged_topics:
                 f.write(topic + "\n")
+        logger.info(f"Saved merged topics to {merged_topics_path}")
