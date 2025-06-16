@@ -15,9 +15,32 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def chunk_with_llm_single_page(page_text: str) -> list[dict]:
+def chunk_with_llm_single_page(page_text: str, topics: set[str] = None) -> list[dict]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    prompt = f"""
+    
+    # If topics are provided, use them to filter content
+    if topics:
+        prompt = f"""
+You are a document analyst. Your task is to identify and extract chunks of text that are relevant to the specified topics.
+Each chunk should:
+- Only contain content that is directly related to one or more of the specified topics
+- Be complete and self-contained
+- Ignore any content that is not relevant to the specified topics
+- Maintain the original text structure and wording
+
+Only extract chunks that are relevant to these topics:
+{chr(10).join(f"- {topic}" for topic in topics)}
+
+Return each relevant chunk separated by the token "||||"
+Example of returned chunks:
+chunk 1||||chunk2||||chunk 3||||chunk 4
+
+Here is the page content:
+
+{page_text}
+"""
+    else:
+        prompt = f"""
 You are a document analyst. Chunk the following page into coherent and meaningful sections.
 Each chunk should:
 - Contain a portion of the text that makes sense on its own
@@ -64,14 +87,14 @@ Page content:
     new_topics = [t.strip() for t in content.split("||||") if t.strip()]
     return new_topics
 
-def further_refine_topics_with_llm(topics: list[str]) -> list[str]:
+def further_refine_topics_with_llm(topics: list[str]) -> set[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-    You are a document analyst refining a list of topics. Take the "List of Topics" and refine them to remove any semantically similar topics.  The final list of topics will be used to power a document search and comparison between two similar documents.
+You are a document analyst refining a list of topics. Take the "List of Topics" and refine them by merging any semantically similar topics into a single broader topic that still captures the core ideas. The final list of topics will be used to power a document search and comparison between two similar documents.
 
-    Return only the refined list of topics, separated by the delimiter "||||".
+Return only the refined list of topics, separated by the delimiter "||||".
 
-    List of Topics:
+List of Topics:
     {chr(10).join(topics)}
     """
     response = call_with_retries(lambda: client.chat.completions.create(
@@ -80,7 +103,7 @@ def further_refine_topics_with_llm(topics: list[str]) -> list[str]:
         temperature=0.3
     ))
     content = response.choices[0].message.content.strip()
-    refined_topics = [t.strip() for t in content.split("||||") if t.strip()]
+    refined_topics = {t.strip() for t in content.split("||||") if t.strip()}
     return refined_topics
 
 def merge_topics_with_llm(topics_a: list[str], topics_b: list[str]) -> list[str]:
@@ -128,9 +151,9 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
     if topics_exist:
         logger.info(f"Topics file exists for {index_type}, skipping topic extraction: {topics_path}")
         with open(topics_path, "r", encoding="utf-8") as f:
-            all_topics = [line.strip() for line in f if line.strip()]
+            all_topics = set({line.strip() for line in f if line.strip()})
     else:
-        all_topics = []
+        all_topics = set()
 
     pages = extract_pages(path)
     if max_pages is not None:
@@ -151,22 +174,22 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
             if not topics_exist:
                 new_topics = extract_topics_with_llm(page, all_topics)
                 # Save initial topics
-                with open(page_dir / "initial_topics.txt", "w", encoding="utf-8") as f:
+                with open(page_dir / "topics.txt", "w", encoding="utf-8") as f:
                     f.write("\n".join(new_topics))
                 logger.info(f"Saved initial topics for page {i+1}")
 
-                # have the LLM check it's own work
-                refined_topics = further_refine_topics_with_llm(new_topics)
-                # Save refined topics
-                with open(page_dir / "refined_topics.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(refined_topics))
-                logger.info(f"Saved refined topics for page {i+1}")
-
                 for topic in new_topics:
                     if topic not in all_topics:
-                        all_topics.append(topic)
+                        all_topics.add(topic)
 
-            page_chunks = chunk_with_llm_single_page(page)
+                # have the LLM check it's own work
+                all_topics = further_refine_topics_with_llm(all_topics)
+                # Save refined topics
+                with open(page_dir / "refined_all_topics.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(all_topics))
+                logger.info(f"Saved refined all topics for page {i+1}")
+
+            page_chunks = chunk_with_llm_single_page(page, all_topics)
             # Save chunks
             with open(page_dir / "chunks.txt", "w", encoding="utf-8") as f:
                 f.write("\n\n---CHUNK---\n\n".join(page_chunks))

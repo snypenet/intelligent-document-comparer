@@ -8,7 +8,7 @@ import time
 from .utils import call_with_retries
 
 
-def compare_documents_to_markdown(job_id: str):
+def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str):
     client = chromadb.PersistentClient(path="./chroma_db")
     collection = client.get_or_create_collection("document_embeddings")
     llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -40,7 +40,8 @@ def compare_documents_to_markdown(job_id: str):
 
     output_path = f"comparison_{job_id}.md"
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"# Topic-Driven Differences for Job {job_id}\n\n")
+        f.write(f"# Topic-Driven Differences\n\n")
+        f.write(f"Comparing:\n- Document A: {doc_a_name}\n- Document B: {doc_b_name}\n\n")
 
     for topic in topics:
         # Find best matching chunks for this topic in both docs using ChromaDB query
@@ -57,10 +58,10 @@ def compare_documents_to_markdown(job_id: str):
                 f"(pages {meta.get('pages')}):\n{doc}" for doc, meta in zip(docs, metas)
             ])
 
-        doc_a_str = format_chunks(docs_a, metas_a) if not missing_a else "[No relevant content found in Document A for this topic.]"
-        doc_b_str = format_chunks(docs_b, metas_b) if not missing_b else "[No relevant content found in Document B for this topic.]"
+        doc_a_str = format_chunks(docs_a, metas_a) if not missing_a else f"[No relevant content found in {doc_a_name} for this topic.]"
+        doc_b_str = format_chunks(docs_b, metas_b) if not missing_b else f"[No relevant content found in {doc_b_name} for this topic.]"
 
-        prompt = f"""You are a document comparison analyst.\n\nFor the topic below, compare Document A and Document B.\n\n- Summarize only the substantive differences in rules, requirements, or content.\n- Be concise and direct; avoid unnecessary elaboration.\n- Always include any relevant numbers, figures, or timelines from both documents in the summary.\n- Reference the page numbers for each difference.\n- Ignore minor wording or formatting changes.\n\nTopic: \"{topic}\"\n\nDocument A (top 3 relevant chunks):\n{doc_a_str}\n\nDocument B (top 3 relevant chunks):\n{doc_b_str}\n"""
+        prompt = f"""You are a document comparison analyst.\n\nFor the topic below, compare {doc_a_name} and {doc_b_name}.\n\n- Summarize only the substantive differences in rules, requirements, or content.\n- Be concise and direct; avoid unnecessary elaboration.\n- Always include any relevant numbers, figures, or timelines from both documents in the summary.\n- Reference the page numbers for each difference.\n- Ignore minor wording or formatting changes.\n\nTopic: \"{topic}\"\n\n{doc_a_name} (top 3 relevant chunks):\n{doc_a_str}\n\n{doc_b_name} (top 3 relevant chunks):\n{doc_b_str}\n"""
 
         # Use retry wrapper for OpenAI call
         response = call_with_retries(lambda: llm.chat.completions.create(
