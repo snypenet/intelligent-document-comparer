@@ -10,6 +10,7 @@ from .utils import call_with_retries
 import uuid
 import logging
 from pathlib import Path
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -80,7 +81,7 @@ Page content:
     response = call_with_retries(lambda: client.chat.completions.create(
         model=os.getenv("MODEL_TYPE"),
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+        temperature=0.2
     ))
     content = response.choices[0].message.content.strip()
     # Split and clean topics
@@ -108,7 +109,7 @@ Return only the final list of consolidated topic labels, separated by the delimi
     response = call_with_retries(lambda: client.chat.completions.create(
         model=os.getenv("MODEL_TYPE"),
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+        temperature=0.2
     ))
     content = response.choices[0].message.content.strip()
     refined_topics = {t.strip() for t in content.split("||||") if t.strip()}
@@ -117,10 +118,18 @@ Return only the final list of consolidated topic labels, separated by the delimi
 def merge_topics_with_llm(topics_a: list[str], topics_b: list[str]) -> list[str]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
-You are a document analyst. Given two lists of topics extracted from two related documents, produce a single, distinct, concise list of all unique topics that exist across both documents. Remove duplicates, merge similar topics, and ensure the list is comprehensive but not redundant. Only keep semanticallty different topics.Return the topics separated by the token "||||".
+You are a domain-aware document analyst. Given two lists of topics extracted from related documents, produce a single, comprehensive list of semantically unique topics.
+
+Merge overlapping or closely related topics into a single, representative phrasing. Eliminate redundancy without omitting distinct ideas.
+
+Focus on semantic distinctiveness, not just surface differences.
+
+Return the final list of consolidated topics, separated by the token "||||" - one topic per entry.
+
+Only output the final list.
 
 Example:
-Topic 1||||Topic 2||||Topic 3||||Topic 4
+Topic A||||Topic B||||Topic C||||Topic D
 
 List A:
 {chr(10).join(topics_a)}
@@ -137,7 +146,7 @@ List B:
     merged_topics = [t.strip() for t in content.split("||||") if t.strip()]
     return merged_topics
 
-def chunk_and_store_document(path: str, file_id: str, index_type: str, use_sliding_window: bool = False, window_size: int = 3, max_pages: int = None):
+def chunk_and_store_document(path: str, file_id: str, index_type: str, use_sliding_window: bool = False, window_size: int = 3, max_pages: int = None) -> Path:
     # Create run directory with GUID
     run_id = str(uuid.uuid4())
     run_dir = Path(f"runs/{run_id}")
@@ -148,6 +157,11 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
     doc_dir = run_dir / f"{file_id}_{index_type}"
     doc_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Created document directory: {doc_dir}")
+
+    # Create chunks directory for storing chunk metadata
+    chunks_dir = doc_dir / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created chunks directory: {chunks_dir}")
 
     topics_path = f"topics_{file_id}_{index_type}.txt"
     other_index_type = "document_b" if index_type == "document_a" else "document_a"
@@ -170,6 +184,7 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
     
     buffer = deque(maxlen=window_size)
     chunk_counter = 0
+    chunk_metadata = []
 
     for i, page in enumerate(tqdm(pages, desc=f"[{index_type.upper()}] Chunking Pages", unit="pg", ascii=True)):
         try:
@@ -216,16 +231,29 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
                         continue  # Skip empty merged chunk
                     pages_in_window = sorted({pn for c in buffer for pn in c["page_numbers"]})
                     doc_id = f"{file_id}_{index_type}_{chunk_counter}"
-                    if not exists(doc_id):
-                        embedding = embed_text(merged_text)
-                        store_embedding({
-                            "id": doc_id,
-                            "file_id": file_id,
-                            "pages": ",".join(map(str, pages_in_window)),
-                            "text": merged_text,
-                            "embedding": embedding,
-                            "index_type": index_type
-                        })
+                    
+                    # Save chunk metadata instead of embedding immediately
+                    chunk_data = {
+                        "id": doc_id,
+                        "file_id": file_id,
+                        "pages": ",".join(map(str, pages_in_window)),
+                        "text": merged_text,
+                        "index_type": index_type,
+                        "chunk_number": chunk_counter,
+                        "use_sliding_window": use_sliding_window,
+                        "window_size": window_size,
+                        "topics": list(all_topics) if all_topics else []
+                    }
+                    
+                    # Save chunk text to file
+                    chunk_file = chunks_dir / f"chunk_{chunk_counter:06d}.txt"
+                    with open(chunk_file, "w", encoding="utf-8") as f:
+                        f.write(merged_text)
+                    
+                    # Save metadata
+                    chunk_data["text_file"] = str(chunk_file)
+                    chunk_metadata.append(chunk_data)
+                    
                     chunk_counter += 1
                 elif not use_sliding_window:
                     # No windowing: process and store immediately
@@ -234,16 +262,29 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
                         continue  # Skip empty chunk
                     pages_in_window = [i+1]
                     doc_id = f"{file_id}_{index_type}_{chunk_counter}"
-                    if not exists(doc_id):
-                        embedding = embed_text(merged_text)
-                        store_embedding({
-                            "id": doc_id,
-                            "file_id": file_id,
-                            "pages": ",".join(map(str, pages_in_window)),
-                            "text": merged_text,
-                            "embedding": embedding,
-                            "index_type": index_type
-                        })
+                    
+                    # Save chunk metadata instead of embedding immediately
+                    chunk_data = {
+                        "id": doc_id,
+                        "file_id": file_id,
+                        "pages": ",".join(map(str, pages_in_window)),
+                        "text": merged_text,
+                        "index_type": index_type,
+                        "chunk_number": chunk_counter,
+                        "use_sliding_window": use_sliding_window,
+                        "window_size": window_size,
+                        "topics": list(all_topics) if all_topics else []
+                    }
+                    
+                    # Save chunk text to file
+                    chunk_file = chunks_dir / f"chunk_{chunk_counter:06d}.txt"
+                    with open(chunk_file, "w", encoding="utf-8") as f:
+                        f.write(merged_text)
+                    
+                    # Save metadata
+                    chunk_data["text_file"] = str(chunk_file)
+                    chunk_metadata.append(chunk_data)
+                    
                     chunk_counter += 1
         except Exception as e:
             logger.error(f"Failed to process page {i+1}: {str(e)}")
@@ -259,18 +300,37 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
                 continue  # Skip empty merged chunk
             pages_in_window = sorted({pn for c in buffer for pn in c["page_numbers"]})
             doc_id = f"{file_id}_{index_type}_{chunk_counter}"
-            if not exists(doc_id):
-                embedding = embed_text(merged_text)
-                store_embedding({
-                    "id": doc_id,
-                    "file_id": file_id,
-                    "pages": ",".join(map(str, pages_in_window)),
-                    "text": merged_text,
-                    "embedding": embedding,
-                    "index_type": index_type
-                })
+            
+            # Save chunk metadata instead of embedding immediately
+            chunk_data = {
+                "id": doc_id,
+                "file_id": file_id,
+                "pages": ",".join(map(str, pages_in_window)),
+                "text": merged_text,
+                "index_type": index_type,
+                "chunk_number": chunk_counter,
+                "use_sliding_window": use_sliding_window,
+                "window_size": window_size,
+                "topics": list(all_topics) if all_topics else []
+            }
+            
+            # Save chunk text to file
+            chunk_file = chunks_dir / f"chunk_{chunk_counter:06d}.txt"
+            with open(chunk_file, "w", encoding="utf-8") as f:
+                f.write(merged_text)
+            
+            # Save metadata
+            chunk_data["text_file"] = str(chunk_file)
+            chunk_metadata.append(chunk_data)
+            
             buffer.popleft()  # Slide window forward
             chunk_counter += 1
+
+    # Save chunk metadata to JSON file
+    metadata_file = doc_dir / "chunk_metadata.json"
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(chunk_metadata, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved chunk metadata to {metadata_file}")
 
     # Save the final topic list to a file for later use (only if it didn't exist)
     if not topics_exist:
@@ -290,3 +350,309 @@ def chunk_and_store_document(path: str, file_id: str, index_type: str, use_slidi
             for topic in merged_topics:
                 f.write(topic + "\n")
         logger.info(f"Saved merged topics to {merged_topics_path}")
+
+    return doc_dir
+
+def assign_topics_to_chunk_with_llm(chunk_text: str, available_topics: list[str]) -> list[str]:
+    """
+    Use LLM to assign 0 or more relevant topics to a chunk from the available topics list.
+    
+    Args:
+        chunk_text: The text content of the chunk
+        available_topics: List of available topics to choose from
+        
+    Returns:
+        List of assigned topic names (can be empty)
+    """
+    if not available_topics:
+        return []
+    
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    prompt = f"""
+You are a careful and domain-aware document analyst. Your task is to assign relevant topics to a text chunk from a predefined list of topics.
+
+Available topics:
+{chr(10).join(f"- {topic}" for topic in available_topics)}
+Text chunk:
+{chunk_text}
+
+Instructions:
+
+    Assign 0 or more topics from the list that are clearly relevant to the content of the chunk.
+
+    Relevance includes explicit mentions and strongly implied themes (e.g., impact, justice, strategy, innovation).
+
+    If a topic's idea is discussed indirectly but central to the chunk, you should include it.
+
+    Do not assign a topic unless it's well-supported by the content (explicitly or semantically).
+
+    It's better to include a semantically relevant topic than to omit it just because the exact phrase wasn't used.
+
+    If no topics are relevant, return an empty string.
+
+Response format:
+
+    Return only topic names from the list, separated by ||||
+
+    If none are relevant, return a blank line (no quotes)
+
+Example responses:
+Topic A||||Topic B||||Topic C
+Topic A
+(empty)
+"""
+    
+    response = call_with_retries(lambda: client.chat.completions.create(
+        model=os.getenv("SUMMARY_MODEL_TYPE"),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    ))
+    
+    content = response.choices[0].message.content.strip()
+    if not content:
+        return []
+    
+    # Split and clean assigned topics
+    assigned_topics = [t.strip() for t in content.split("||||") if t.strip()]
+    
+    # Validate that all assigned topics exist in the available topics list
+    valid_topics = [topic for topic in assigned_topics if topic in available_topics]
+    
+    return valid_topics
+
+def review_assigned_topics_with_llm(chunk_text: str, initial_topics: list[str], available_topics: list[str]) -> list[str]:
+    """
+    Use LLM to review the initial topic assignment for a chunk and either confirm or revise the list from the available topics.
+    """
+    if not available_topics or not initial_topics:
+        return initial_topics or []
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    prompt = f"""
+You are a careful and domain-aware document analyst. You have already assigned the following topics to a text chunk from a predefined list of topics:
+
+Initial assigned topics:
+{chr(10).join(f"- {topic}" for topic in initial_topics)}
+
+Available topics:
+{chr(10).join(f"- {topic}" for topic in available_topics)}
+
+Text chunk:
+{chunk_text}
+
+Instructions:
+    Review the initial assigned topics. If they are all appropriate and no others are needed, return the same list.
+    If you believe some topics should be removed or others from the available list should be added, return a revised list.
+    Only use topics from the available list. Do not invent new topics.
+    If no topics are relevant, return a blank line (no quotes).
+
+Response format:
+    Return only topic names from the list, separated by ||||
+    If none are relevant, return a blank line (no quotes)
+
+Example responses:
+Topic A||||Topic B
+Topic A
+(empty)
+"""
+    response = call_with_retries(lambda: client.chat.completions.create(
+        model=os.getenv("SUMMARY_MODEL_TYPE"),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    ))
+    content = response.choices[0].message.content.strip()
+    if not content:
+        return []
+    reviewed_topics = [t.strip() for t in content.split("||||") if t.strip()]
+    valid_topics = [topic for topic in reviewed_topics if topic in available_topics]
+    return valid_topics
+
+def process_multiple_document_directories(doc_dirs: list[Path]) -> None:
+    """
+    Process chunks from multiple document directories using a shared merged topics file.
+    
+    Args:
+        doc_dirs: List of paths to document directories containing chunk metadata
+    """
+    logger.info(f"Processing chunks from {len(doc_dirs)} document directories")
+    
+    # Try to find a merged topics file from any of the directories
+    available_topics = []
+    merged_topics_found = False
+    
+    for doc_dir in doc_dirs:
+        if not doc_dir.exists():
+            logger.warning(f"Document directory does not exist: {doc_dir}")
+            continue
+        
+        # Load chunk metadata to get file_id
+        metadata_file = doc_dir / "chunk_metadata.json"
+        if not metadata_file.exists():
+            logger.warning(f"Chunk metadata file not found: {metadata_file}")
+            continue
+        
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            chunk_metadata = json.load(f)
+        
+        if not chunk_metadata:
+            logger.warning(f"No chunk metadata found in {doc_dir}")
+            continue
+        
+        file_id = chunk_metadata[0]["file_id"]
+        
+        # Try to read merged topics file
+        merged_topics_path = f"topics_{file_id}_merged.txt"
+        if os.path.exists(merged_topics_path):
+            logger.info(f"Found merged topics file: {merged_topics_path}")
+            with open(merged_topics_path, "r", encoding="utf-8") as f:
+                available_topics = [line.strip() for line in f if line.strip()]
+            merged_topics_found = True
+            break
+    
+    # If no merged topics file found, try to use document_a topics as fallback
+    if not merged_topics_found:
+        for doc_dir in doc_dirs:
+            if not doc_dir.exists():
+                continue
+            
+            metadata_file = doc_dir / "chunk_metadata.json"
+            if not metadata_file.exists():
+                continue
+            
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                chunk_metadata = json.load(f)
+            
+            if not chunk_metadata:
+                continue
+            
+            file_id = chunk_metadata[0]["file_id"]
+            topics_path = f"topics_{file_id}_document_a.txt"
+            
+            if os.path.exists(topics_path):
+                logger.info(f"Using fallback topics file: {topics_path}")
+                with open(topics_path, "r", encoding="utf-8") as f:
+                    available_topics = [line.strip() for line in f if line.strip()]
+                break
+    
+    if not available_topics:
+        logger.warning("No topics file found. Using empty topic list.")
+    
+    logger.info(f"Using {len(available_topics)} topics for categorization across all documents")
+    
+    # Process each directory using the shared topics
+    for doc_dir in doc_dirs:
+        if not doc_dir.exists():
+            logger.warning(f"Document directory does not exist: {doc_dir}")
+            continue
+        
+        logger.info(f"Processing document directory: {doc_dir}")
+        process_chunks_from_directory_with_topics(doc_dir, available_topics)
+    
+    logger.info("Completed processing all document directories")
+
+def process_chunks_from_directory_with_topics(doc_dir: Path, available_topics: list[str]) -> None:
+    """
+    Process chunks from a document directory using provided topics.
+    
+    Args:
+        doc_dir: Path to the document directory containing chunk metadata
+        available_topics: List of topics to use for categorization
+    """
+    metadata_file = doc_dir / "chunk_metadata.json"
+    if not metadata_file.exists():
+        logger.error(f"Chunk metadata file not found: {metadata_file}")
+        return
+    
+    # Load chunk metadata
+    with open(metadata_file, "r", encoding="utf-8") as f:
+        chunk_metadata = json.load(f)
+    
+    logger.info(f"Processing {len(chunk_metadata)} chunks from {doc_dir}")
+    
+    for chunk_data in tqdm(chunk_metadata, desc="Embedding chunks", unit="chunk"):
+        try:
+            # Check if chunk already exists in database
+            if exists(chunk_data["id"]):
+                logger.debug(f"Chunk {chunk_data['id']} already exists, skipping")
+                continue
+            
+            # Read chunk text from file
+            text_file = Path(chunk_data["text_file"])
+            if not text_file.exists():
+                logger.warning(f"Chunk text file not found: {text_file}")
+                continue
+            
+            with open(text_file, "r", encoding="utf-8") as f:
+                chunk_text = f.read()
+            
+            # First LLM call: assign topics
+            initial_assigned_topics = assign_topics_to_chunk_with_llm(chunk_text, available_topics)
+            # Second LLM call: review/confirm topics
+            assigned_topics = review_assigned_topics_with_llm(chunk_text, initial_assigned_topics, available_topics)
+            
+            # Generate embedding
+            embedding = embed_text(chunk_text)
+            
+            # Store in database with assigned topics
+            store_embedding({
+                "id": chunk_data["id"],
+                "file_id": chunk_data["file_id"],
+                "pages": chunk_data["pages"],
+                "text": chunk_text,
+                "embedding": embedding,
+                "index_type": chunk_data["index_type"],
+                "assigned_topics": "||||".join(assigned_topics) if assigned_topics else ""
+            })
+            
+            logger.debug(f"Successfully processed chunk {chunk_data['id']} with {len(assigned_topics)} assigned topics (after review)")
+            
+        except Exception as e:
+            logger.error(f"Failed to process chunk {chunk_data.get('id', 'unknown')}: {str(e)}")
+            traceback.print_exc()
+    
+    logger.info(f"Completed processing chunks from {doc_dir}")
+
+def process_chunks_from_directory(doc_dir: Path) -> None:
+    """
+    Process chunks from a document directory and embed/store them in the database.
+    This function reads topics from the merged topics file for consistency.
+    
+    Args:
+        doc_dir: Path to the document directory containing chunk metadata
+    """
+    metadata_file = doc_dir / "chunk_metadata.json"
+    if not metadata_file.exists():
+        logger.error(f"Chunk metadata file not found: {metadata_file}")
+        return
+    
+    # Load chunk metadata
+    with open(metadata_file, "r", encoding="utf-8") as f:
+        chunk_metadata = json.load(f)
+    
+    # Get file_id from the first chunk to construct the merged topics file path
+    if not chunk_metadata:
+        logger.error("No chunk metadata found")
+        return
+    
+    file_id = chunk_metadata[0]["file_id"]
+    
+    # Read topics from the merged topics file
+    merged_topics_path = f"topics_{file_id}_merged.txt"
+    topics_path = f"topics_{file_id}_document_a.txt"  # fallback
+    
+    available_topics = []
+    if os.path.exists(merged_topics_path):
+        logger.info(f"Reading topics from merged file: {merged_topics_path}")
+        with open(merged_topics_path, "r", encoding="utf-8") as f:
+            available_topics = [line.strip() for line in f if line.strip()]
+    elif os.path.exists(topics_path):
+        logger.info(f"Reading topics from fallback file: {topics_path}")
+        with open(topics_path, "r", encoding="utf-8") as f:
+            available_topics = [line.strip() for line in f if line.strip()]
+    else:
+        logger.warning(f"No topics file found. Using empty topic list.")
+        available_topics = []
+    
+    logger.info(f"Loaded {len(available_topics)} topics for categorization")
+    
+    # Use the shared function with the loaded topics
+    process_chunks_from_directory_with_topics(doc_dir, available_topics)
