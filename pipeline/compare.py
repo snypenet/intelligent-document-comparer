@@ -1,17 +1,26 @@
 import os
 import json
-import chromadb
 from openai import OpenAI
-from .embed import embed_text
-import numpy as np
+from .db import query_by_topics, hybrid_search, topic_aware_semantic_search
 import time
 from .utils import call_with_retries
 from pathlib import Path
 
 
-def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str):
-    client = chromadb.PersistentClient(path="./chroma_db")
-    collection = client.get_or_create_collection("document_embeddings")
+def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str, 
+                                 search_mode: str = "topic_only"):
+    """
+    Compare documents using different search strategies.
+    
+    Args:
+        job_id: Unique identifier for the document pair
+        doc_a_name: Name of document A
+        doc_b_name: Name of document B
+        search_mode: Search strategy to use:
+            - "topic_only": Use only topic-based filtering
+            - "hybrid": Combine topic filtering with embedding similarity
+            - "topic_aware": Semantic search with topic relevance bonus
+    """
     llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     # Create run directory for logs
@@ -30,25 +39,60 @@ def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str)
         with open(topics_path, "r", encoding="utf-8") as f:
             topics = [line.strip() for line in f if line.strip()]
 
-    def get_best_chunks(topic, collection, job_id, index_type, n_results=3):
-        topic_emb = embed_text(topic)
-        result = collection.query(
-            query_embeddings=topic_emb,
-            where={"$and": [{"index_type": index_type}, {"file_id": job_id}]},
-            n_results=n_results
-        )
-        if not result["documents"] or not result["documents"][0]:
-            print(f"[Warning] No match found for topic: {topic} in {index_type}")
+    def get_chunks_by_search_mode(topic, job_id, index_type, n_results=5):
+        """
+        Get chunks using the specified search mode.
+        """
+        where_clause = {"$and": [{"index_type": index_type}, {"file_id": job_id}]}
+        
+        try:
+            if search_mode == "topic_only":
+                # Pure topic-based filtering
+                result = query_by_topics(
+                    topics=[topic],
+                    n_results=n_results,
+                    where=where_clause
+                )
+            elif search_mode == "hybrid":
+                # Hybrid search: topic filtering + embedding similarity
+                result = hybrid_search(
+                    query_text=topic,
+                    topics=[topic],
+                    n_results=n_results,
+                    where=where_clause,
+                    topic_weight=0.4,
+                    embedding_weight=0.6
+                )
+            elif search_mode == "topic_aware":
+                # Semantic search with topic relevance bonus
+                result = topic_aware_semantic_search(
+                    query_text=topic,
+                    topics=[topic],
+                    n_results=n_results,
+                    where=where_clause,
+                    topic_threshold=0.5
+                )
+            else:
+                raise ValueError(f"Unknown search mode: {search_mode}")
+            
+            if not result["documents"] or not result["documents"][0]:
+                print(f"[Warning] No chunks found for topic '{topic}' in {index_type} using {search_mode} mode")
+                return [], [], []
+            
+            docs = result["documents"][0]
+            metas = result["metadatas"][0]
+            ids = result["ids"][0]
+            return docs, metas, ids
+            
+        except Exception as e:
+            print(f"[Error] Failed to query chunks for topic '{topic}' in {index_type} using {search_mode} mode: {e}")
             return [], [], []
-        docs = result["documents"][0]
-        metas = result["metadatas"][0]
-        ids = result["ids"][0]
-        return docs, metas, ids
 
-    output_path = f"comparison_{job_id}.md"
+    output_path = f"comparison_{job_id}_{search_mode}.md"
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"# Topic-Driven Differences\n\n")
+        f.write(f"# Topic-Driven Differences ({search_mode.replace('_', ' ').title()} Mode)\n\n")
         f.write(f"Comparing:\n- Document A: {doc_a_name}\n- Document B: {doc_b_name}\n\n")
+        f.write(f"Search Mode: {search_mode}\n\n")
         
         # Add alphabetized list of topics with links
         f.write("## Topics Covered\n\n")
@@ -61,33 +105,40 @@ def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str)
     # Process topics in alphabetical order
     for topic in sorted(topics):
         # Create topic-specific log file
-        topic_log_path = logs_dir / f"{topic.lower().replace(' ', '_')}_log.txt"
+        topic_log_path = logs_dir / f"{topic.lower().replace(' ', '_')}_{search_mode}_log.txt"
         with open(topic_log_path, "w", encoding="utf-8") as log:
             log.write(f"Topic: {topic}\n")
+            log.write(f"Search Mode: {search_mode}\n")
             log.write("=" * 80 + "\n\n")
 
-            # Find best matching chunks for this topic in both docs using ChromaDB query
-            docs_a, metas_a, ids_a = get_best_chunks(topic, collection, job_id, "document_a", 5)
-            docs_b, metas_b, ids_b = get_best_chunks(topic, collection, job_id, "document_b", 5)
+            # Find chunks using the specified search mode
+            docs_a, metas_a, ids_a = get_chunks_by_search_mode(topic, job_id, "document_a", 5)
+            docs_b, metas_b, ids_b = get_chunks_by_search_mode(topic, job_id, "document_b", 5)
             
-            # Log vector search results
-            log.write(f"Vector Search Results for {doc_a_name}:\n")
+            # Log search results
+            log.write(f"Search Results for {doc_a_name}:\n")
             log.write("-" * 40 + "\n")
             for doc, meta in zip(docs_a, metas_a):
                 log.write(f"Pages: {meta.get('pages')}\n")
+                log.write(f"Assigned Topics: {meta.get('assigned_topics', 'N/A')}\n")
+                if search_mode != "topic_only":
+                    log.write(f"Score: {meta.get('score', 'N/A')}\n")
                 log.write(f"Content: {doc}\n\n")
             
-            log.write(f"Vector Search Results for {doc_b_name}:\n")
+            log.write(f"Search Results for {doc_b_name}:\n")
             log.write("-" * 40 + "\n")
             for doc, meta in zip(docs_b, metas_b):
                 log.write(f"Pages: {meta.get('pages')}\n")
+                log.write(f"Assigned Topics: {meta.get('assigned_topics', 'N/A')}\n")
+                if search_mode != "topic_only":
+                    log.write(f"Score: {meta.get('score', 'N/A')}\n")
                 log.write(f"Content: {doc}\n\n")
 
             missing_a = not docs_a
             missing_b = not docs_b
             if missing_a and missing_b:
                 print(f"[Warning] Skipping topic due to missing chunks in both documents: {topic}")
-                log.write("Skipped: No relevant content found in either document\n")
+                log.write("Skipped: No chunks found with this topic in either document\n")
                 continue
 
             def format_chunks(docs, metas):
@@ -95,8 +146,8 @@ def compare_documents_to_markdown(job_id: str, doc_a_name: str, doc_b_name: str)
                     f"(pages {meta.get('pages')}):\n{doc}" for doc, meta in zip(docs, metas)
                 ])
 
-            doc_a_str = format_chunks(docs_a, metas_a) if not missing_a else f"[No relevant content found in {doc_a_name} for this topic.]"
-            doc_b_str = format_chunks(docs_b, metas_b) if not missing_b else f"[No relevant content found in {doc_b_name} for this topic.]"
+            doc_a_str = format_chunks(docs_a, metas_a) if not missing_a else f"[No chunks found with topic '{topic}' in {doc_a_name}.]"
+            doc_b_str = format_chunks(docs_b, metas_b) if not missing_b else f"[No chunks found with topic '{topic}' in {doc_b_name}.]"
 
             prompt = f"""
 You are a document comparison analyst.
@@ -118,10 +169,10 @@ When differences do exist:
 - Always cite the page numbers where the differences appear.
 
 Reference:
-- {doc_a_name} (top 3 relevant chunks):
+- {doc_a_name} (chunks found using {search_mode} search for topic '{topic}'):
 {doc_a_str}
 
-- {doc_b_name} (top 3 relevant chunks):
+- {doc_b_name} (chunks found using {search_mode} search for topic '{topic}'):
 {doc_b_str}
             """
             
